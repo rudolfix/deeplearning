@@ -1,0 +1,6 @@
+.idea
+tensorflow/
+__pycache__
+*.zip
+*_train/
+
