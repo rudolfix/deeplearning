@@ -155,3 +155,13 @@ class ReverseSeqModel(object):
             return None, outputs[1], outputs[2]  # loss and state
         else:
             return None, outputs[0], outputs[1]  # No gradient norm, loss, prediction.
+
+
+class ReverseSeqValidationSummaryModel(object):
+    def __init__(self, graph):
+        with graph.as_default():
+            # validation perplexity summary
+            self.validation_perp = tf.placeholder(tf.float32)
+            validation_perp_summ = tf.scalar_summary('validation perplexity', self.validation_perp)
+            self.merged_validation = tf.merge_all_summaries()
+            self.graph = graph
