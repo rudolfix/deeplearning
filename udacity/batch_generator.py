@@ -14,14 +14,16 @@ class BatchGenerator(object):
     FIRST_LETTER = ord(string.ascii_lowercase[0]) - len(VOCAB_START)  # put PAD + EOS + GO at idx 0,1,2 respectively
     WORD_BREAKERS = [' ']
 
-    def __init__(self, text, batch_size, min_unrollings, max_unrollings, reverse_encoder_input = False):
+    def __init__(self, text, batch_size, min_unrollings, max_unrollings, reverse_encoder_input = False,
+                 random_batch = True):
         self._text = text
         self._text_size = len(text)
         self._batch_size = batch_size
         self._min_unrollings = min_unrollings
         self._max_unrollings = max_unrollings
-        self._word_boundary_idx = self._idx = self._text_size - 10
+        self._word_boundary_idx = self._idx = 0
         self._reverse_encoder_input = reverse_encoder_input
+        self._random_batch = random_batch
 
     def reverse_word(self, decoder_batch, enc_idx, self_idx):
             idx_diff = (self_idx - self._word_boundary_idx) % self._text_size # needs modulo as idx may wrap
@@ -34,8 +36,9 @@ class BatchGenerator(object):
         """Generate a single batch from the current cursor position in the data."""
         # generate variable size batch, will be padded to _max_unrollings
         unrollings = random.randint(self._min_unrollings, self._max_unrollings)
-        # generate batch from random position on the text, corpus seems to be not mixed well
-        self._word_boundary_idx = self._idx = random.randint(0, self._text_size - 1)
+        if self._random_batch:
+            # generate batch from random position on the text, corpus seems to be not mixed well
+            self._word_boundary_idx = self._idx = random.randint(0, self._text_size - 1)
         # note that zero is PAD idx, so no need to pad explicitly
         encoder_batch = np.zeros(shape=(self._max_unrollings, BatchGenerator.VOCABULARY_SIZE), dtype=np.float)
         decoder_batch = np.zeros(shape=(self._max_unrollings + 2, BatchGenerator.VOCABULARY_SIZE), dtype=np.float)
@@ -120,3 +123,8 @@ class BatchGenerator(object):
             return chr(dictid + BatchGenerator.FIRST_LETTER)
         else:
             return BatchGenerator.VOCAB_START[dictid]
+
+    @staticmethod
+    def logprob(predictions, labels):
+        predictions[predictions < 1e-10] = 1e-10
+        return np.sum(np.multiply(labels, -np.log(predictions))) / labels.shape[0]
