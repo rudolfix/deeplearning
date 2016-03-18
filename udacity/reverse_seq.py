@@ -18,30 +18,34 @@
 
 import os
 import sys
+import fileinput
 import numpy as np
-import random
-import string
 import tensorflow as tf
 import zipfile
 import urllib3
 import time
 import math
 from batch_generator import BatchGenerator
-from reverse_seq_model import ReverseSeqModel
+from reverse_seq_model import ReverseSeqModel, ReverseSeqValidationSummaryModel
 
-url = 'http://mattmahoney.net/dc/'
 BATCH_SIZE = 256
 MIN_CHARS_IN_BATCH = 64
 MAX_CHARS_IN_BATCH = 64
+NUM_LAYERS = 3
+UNITS_PER_LAYER = 256
+DROPOUT_PROB = 0.6
+LEARNING_RATE = 0.3
+RUN_NAME_SUFFIX = 'L0.3' # additional suffix to describe run names
+
+GRADIENT_CLIP = 5
+LEARNING_RATE_DECAY_RATIO = 0.97
 STEPS_PER_CHECKPOINT = 50
 TRAIN_DIR = 'reverse_seq_train'
-DROPOUT_PROB = 0.8
-RUN_NAME_SUFFIX = ''
 
 
 def maybe_download(filename, expected_bytes):
     if not os.path.exists(filename):
-        filename, _ = urlretrieve(url + filename, filename)
+        filename, _ = urlretrieve('http://mattmahoney.net/dc/' + filename, filename)
     statinfo = os.stat(filename)
     if statinfo.st_size == expected_bytes:
         print('Found and verified %s' % filename)
@@ -70,7 +74,7 @@ def run_data_directory(num_layers, units_per_layer):
 def create_model(session, num_layers, units_per_layer, forward_only):
     model = ReverseSeqModel(units_per_layer, num_layers,
                             BatchGenerator.VOCABULARY_SIZE,
-                            MAX_CHARS_IN_BATCH, 5, 0.1, 0.97,
+                            MAX_CHARS_IN_BATCH, GRADIENT_CLIP, LEARNING_RATE, LEARNING_RATE_DECAY_RATIO,
                             forward_only=forward_only)
     run_data_dir = run_data_directory(num_layers, units_per_layer)
     model.summ_writer = tf.train.SummaryWriter(run_data_dir, session.graph_def, flush_secs=1)
@@ -81,6 +85,7 @@ def create_model(session, num_layers, units_per_layer, forward_only):
     else:
         print("Created model with fresh parameters.")
         session.run(tf.initialize_all_variables())
+
     return model
 
 
@@ -88,67 +93,114 @@ def train(num_layers, units_per_layer):
     print('download and read data')
     filename = maybe_download('text8.zip', 31344016)
 
-    with tf.Session() as sess:
+    with tf.Session(graph=tf.Graph()) as validation_session:
+        validation_model = ReverseSeqValidationSummaryModel(validation_session.graph)
+        validation_session.run(tf.initialize_all_variables())
+
+        with tf.Session(graph=tf.Graph()) as sess:
+            # Create model.
+            print("Creating %d layers of %d units." % (num_layers, units_per_layer))
+            model = create_model(sess, num_layers, units_per_layer, False)
+
+            # Read data
+            text = read_data(filename)
+            # create datasets
+            valid_size = 1000
+            valid_text = text[:valid_size]
+            train_text = text[valid_size:]
+            # train_size = len(train_text)
+            # create batch generators
+            train_batch = BatchGenerator(train_text, BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                         reverse_encoder_input=True)
+            validation_batch = BatchGenerator(valid_text, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                              reverse_encoder_input=True)
+
+            # This is the training loop.
+            step_time, loss = 0.0, 0.0
+            current_step = model.global_step.eval() + 1
+            print('starting from step %i' % current_step)
+            previous_losses = []
+            enc_state = model.initial_enc_state.eval()
+            run_data_dir = run_data_directory(num_layers, units_per_layer)
+            while True:
+                # Get a batch and make a step.
+                start_time = time.time()
+                encoder_inputs, decoder_inputs, decoder_weights = train_batch.next()
+                _, step_loss, enc_state = model.step(sess, current_step, encoder_inputs, decoder_inputs, decoder_weights,
+                                                     enc_state, DROPOUT_PROB, False)
+                step_time += (time.time() - start_time) / STEPS_PER_CHECKPOINT
+                loss += step_loss / STEPS_PER_CHECKPOINT
+                current_step += 1
+                # Once in a while, we save checkpoint, print statistics, and run evals.
+                if current_step % STEPS_PER_CHECKPOINT == 0:
+                    # Print statistics for the previous epoch.
+                    perplexity = math.exp(loss) if loss < 300 else float('inf')
+                    print("global step %d learning rate %.4f step-time %.2f loss %.3f perplexity "
+                          "%.2f" % (model.global_step.eval(), model.learning_rate.eval(),
+                                    step_time, loss, perplexity))
+                    # Decrease learning rate if no improvement was seen over last 3 times.
+                    if len(previous_losses) > 2 and loss > max(previous_losses[-3:]):
+                        sess.run(model.learning_rate_decay_op)
+                    previous_losses.append(loss)
+                    # Save checkpoint and zero timer and loss.
+                    checkpoint_path = os.path.join(run_data_dir, 'state')
+                    model.saver.save(sess, checkpoint_path, global_step=model.global_step)
+                    step_time, loss = 0.0, 0.0
+                    # Run evals on validation set and print their perplexity.
+                    val_perp = validate_sentence(sess, model, validation_batch, enc_state, current_step)
+                    summary_str = validation_model.merged_validation.eval(
+                        {validation_model.validation_perp: val_perp if val_perp < 500 else 500 },
+                        validation_session)
+                    model.summ_writer.add_summary(summary_str, current_step)
+
+                    sys.stdout.flush()
+
+
+def decode(num_layers, units_per_layer):
+    print('Will decode')
+    with tf.Session(graph=tf.Graph()) as sess:
         # Create model.
         print("Creating %d layers of %d units." % (num_layers, units_per_layer))
         model = create_model(sess, num_layers, units_per_layer, False)
-
-        # Read data
-        text = read_data(filename)
-        # create datasets
-        valid_size = 1000
-        valid_text = text[:valid_size]
-        train_text = text[valid_size:]
-        # train_size = len(train_text)
-        # create batch generators
-        train_batch = BatchGenerator(train_text, BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
-                                     reverse_encoder_input=True)
-        validation_batch = BatchGenerator(valid_text, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
-                                          reverse_encoder_input=True)
-
-        # This is the training loop.
-        step_time, loss = 0.0, 0.0
         current_step = model.global_step.eval() + 1
-        print('starting from step %i' % current_step)
-        previous_losses = []
         enc_state = model.initial_enc_state.eval()
-        run_data_dir = run_data_directory(num_layers, units_per_layer)
-        while True:
-            # Get a batch and make a step.
-            start_time = time.time()
-            encoder_inputs, decoder_inputs, decoder_weights = train_batch.next()
-            _, step_loss, enc_state = model.step(sess, current_step, encoder_inputs, decoder_inputs, decoder_weights,
-                                                 enc_state, DROPOUT_PROB, False)
-            step_time += (time.time() - start_time) / STEPS_PER_CHECKPOINT
-            loss += step_loss / STEPS_PER_CHECKPOINT
-            current_step += 1
-            # Once in a while, we save checkpoint, print statistics, and run evals.
-            if current_step % STEPS_PER_CHECKPOINT == 0:
-                # Print statistics for the previous epoch.
-                perplexity = math.exp(loss) if loss < 300 else float('inf')
-                print("global step %d learning rate %.4f step-time %.2f loss %.3f perplexity "
-                      "%.2f" % (model.global_step.eval(), model.learning_rate.eval(),
-                                step_time, loss, perplexity))
-                # Decrease learning rate if no improvement was seen over last 3 times.
-                if len(previous_losses) > 2 and loss > max(previous_losses[-3:]):
-                    sess.run(model.learning_rate_decay_op)
-                previous_losses.append(loss)
-                # Save checkpoint and zero timer and loss.
-                checkpoint_path = os.path.join(run_data_dir, 'state')
-                model.saver.save(sess, checkpoint_path, global_step=model.global_step)
-                step_time, loss = 0.0, 0.0
-                # Run evals on validation set and print their perplexity.
-                encoder_inputs, decoder_inputs, decoder_weights = validation_batch.next()
-                _, eval_loss, prediction = model.step(sess, current_step - 1, encoder_inputs, decoder_inputs,
-                                                      decoder_weights, enc_state[-1:], 1.0, True)
-                eval_ppx = math.exp(eval_loss) if eval_loss < 300 else float('inf')
-                print("  eval: loss %.3f, perplexity %.2f" % (eval_loss, eval_ppx))
-                print(BatchGenerator.batches2string(encoder_inputs))
-                print(BatchGenerator.batches2string(decoder_inputs))
-                rolled = np.rollaxis(np.asarray([prediction]), 1, 0)
-                splitted = np.vsplit(rolled, rolled.shape[0])
-                print(BatchGenerator.batches2string([np.squeeze(e,0) for e in splitted]))
-                sys.stdout.flush()
+        print('starting from step %i' % current_step)
+        # Decode from standard input.
+        sentence = input('>')
+        while sentence:
+            # make it exactly max_unrollings and not less than min_unrollings
+            sentence = sentence[:MAX_CHARS_IN_BATCH] + ' '*(MIN_CHARS_IN_BATCH-len(sentence))
+            validation_batch = BatchGenerator(sentence, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                              reverse_encoder_input=True, random_batch=False)
+            validate_sentence(sess, model, validation_batch, enc_state, current_step)
+            sentence = input('>')
+
+
+def validate_sentence(session, model, validation_batch, encoder_state, current_step):
+    encoder_inputs, single_decoder_inputs, decoder_weights = validation_batch.next()
+    print(BatchGenerator.batches2string(encoder_inputs))
+    print(BatchGenerator.batches2string(single_decoder_inputs))
+    # replicate to full batch size so we have multiple results agains the whole state
+    encoder_inputs = [np.repeat(x, BATCH_SIZE, axis=0) for x in encoder_inputs]
+    decoder_inputs = [np.repeat(x, BATCH_SIZE, axis=0) for x in single_decoder_inputs]
+    decoder_weights = [np.repeat(x, BATCH_SIZE, axis=0) for x in decoder_weights]
+    # _, eval_loss, prediction = model.step(sess, current_step - 1, encoder_inputs, decoder_inputs,
+    #                                      decoder_weights, enc_state[-1:], 1.0, True)
+    _, eval_loss, prediction = model.step(session, current_step - 1, encoder_inputs, decoder_inputs,
+                                          decoder_weights, encoder_state, 1.0, True)
+    # split into 'no of batches' list then average across batches
+    reshaped = np.reshape(prediction, (prediction.shape[0] / BATCH_SIZE, BATCH_SIZE, prediction.shape[1]))
+    averaged = np.mean(reshaped, axis=1)
+    # now roll as in case of single batch
+    rolled = np.rollaxis(np.asarray([averaged]), 1, 0)
+    splitted = np.vsplit(rolled, rolled.shape[0])
+    squeezed = [np.squeeze(e,0) for e in splitted]
+    print(BatchGenerator.batches2string(squeezed))
+    # compute character to character perplexity
+    val_perp = float(np.exp(BatchGenerator.logprob(np.concatenate(squeezed),
+                                                   np.concatenate(single_decoder_inputs[1:]))))
+    print('--validation perp.: %.2f' % val_perp)
+    return val_perp
 
 
 def run_test():
@@ -186,9 +238,23 @@ def run_test():
 
 
 def main(_):
-    train(3, 64)
-    #run_test()
+    if FLAGS.self_test:
+        run_test()
+    elif FLAGS.decode:
+        decode(NUM_LAYERS, UNITS_PER_LAYER)
+    elif FLAGS.train:
+        train(NUM_LAYERS, UNITS_PER_LAYER)
+    else:
+        print('set decode or train flags')
 
+tf.app.flags.DEFINE_boolean("decode", False,
+                            "Set to True for interactive decoding.")
+tf.app.flags.DEFINE_boolean("self_test", False,
+                            "Run a self-test if this is set to True.")
+tf.app.flags.DEFINE_boolean("train", True,
+                            "trains the network if this is set to True.")
+
+FLAGS = tf.app.flags.FLAGS
 
 if __name__ == "__main__":
     tf.app.run()
