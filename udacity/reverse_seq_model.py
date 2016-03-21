@@ -1,18 +1,18 @@
-import random
 import numpy as np
 import tensorflow as tf
 from batch_generator import BatchGenerator
 
 
 class ReverseSeqModel(object):
-    def __init__(self, size, num_layers, vocab_size, max_unrollings,
+    def __init__(self, batch_size, units_per_layer, num_layers, vocab_size, max_unrollings,
                  max_gradient_norm, learning_rate,
                  learning_rate_decay_factor, use_lstm=True,
-                 forward_only=False):
+                 forward_only=False, feed_previous=False):
         """Create the model.
 
         Args:
-          size: number of units in each layer of the model.
+          batch_size: is not stored and is not used at runtime
+          units_per_layer: number of units in each layer of the model.
           num_layers: number of layers in the model.
           max_gradient_norm: gradients will be clipped to maximally this norm.
           learning_rate: learning rate to start with.
@@ -20,23 +20,40 @@ class ReverseSeqModel(object):
           use_lstm: if true, we use LSTM cells instead of GRU cells.
           forward_only: if set, we do not construct the backward pass in the model.
         """
-        # self.batch_size = batch_size
         self.max_unrollings = max_unrollings
         self.learning_rate = tf.Variable(float(learning_rate), trainable=False)
         self.learning_rate_decay_op = self.learning_rate.assign(self.learning_rate * learning_rate_decay_factor)
         self.global_step = tf.Variable(0, trainable=False)
         self.keep_prob = tf.placeholder(tf.float32)
+
+        # compute predictions (of size vocab) from rnn output (of size units_per_layer)
+        softmax_w = tf.Variable(tf.truncated_normal([units_per_layer, vocab_size], -0.1, 0.1))
+        softmax_b = tf.Variable(tf.zeros([vocab_size]))
+
+        # summaries
         max_unrollings_summ = tf.scalar_summary("max unrollings", max_unrollings)
         learning_rate_summ = tf.scalar_summary("learning rate", self.learning_rate)
         num_layers_summ = tf.scalar_summary("num of layers", num_layers)
-        num_nodes_summ = tf.scalar_summary("nodes per layer", size)
+        num_nodes_summ = tf.scalar_summary("nodes per layer", units_per_layer)
         keep_prob_summ = tf.scalar_summary("dropout prob", self.keep_prob, name='keep_prob')
         self.summ_writer = None # instantiated by upper layer
 
+        # onehot encodings of character vocab for embedding in decoder mode (loop_function)
+        np_embeds = np.zeros((vocab_size, vocab_size))
+        np.fill_diagonal(np_embeds,1)
+        vocab_onehot = tf.constant(np.reshape(np_embeds, -1), dtype=tf.float32, shape=[vocab_size, vocab_size])
+
+        def decoder_loop_function(prev, _):
+            #  batch size*vocab_size in prev -> make argmax = 1 and zero all others
+            prev = tf.stop_gradient(tf.matmul(prev, softmax_w) + softmax_b)
+            prev_labels = tf.stop_gradient(tf.argmax(prev, 1))
+            return tf.gather(vocab_onehot, prev_labels)
+        loop_function = decoder_loop_function if feed_previous else None
+
         # Create the internal multi-layer cell for our RNN.
-        single_cell = tf.nn.rnn_cell.GRUCell(size)
+        single_cell = tf.nn.rnn_cell.GRUCell(units_per_layer)
         if use_lstm:
-            single_cell = tf.nn.rnn_cell.BasicLSTMCell(size)
+            single_cell = tf.nn.rnn_cell.BasicLSTMCell(units_per_layer)
         cell = tf.nn.rnn_cell.DropoutWrapper(single_cell, output_keep_prob=self.keep_prob)
         if num_layers > 1:
             cell = tf.nn.rnn_cell.MultiRNNCell([single_cell] * num_layers)
@@ -53,17 +70,16 @@ class ReverseSeqModel(object):
             self.decoder_weights.append(tf.placeholder(tf.float32, shape=[None], name='decoder-weights-%i' % i))
         # self.zero_state = cell.zero_state()
         # zs = cell.zero_state(256, tf.float32) # tf.placeholder(tf.float32, shape=[None, 2 * size])
-        self.initial_enc_state = tf.truncated_normal([256, cell.state_size], -0.1, 0.1)
+        self.initial_enc_state = tf.truncated_normal([batch_size, cell.state_size], -0.1, 0.1)
         # run encoder - decoder
         self.outputs, _, self.enc_state = ReverseSeqModel.basic_rnn_seq2seq(self.encoder_inputs,
-                                                                           self.decoder_inputs[:max_unrollings + 1],
-                                                                           self.initial_enc_state, cell)
+                                                                            self.decoder_inputs[:max_unrollings + 1],
+                                                                            self.initial_enc_state, cell,
+                                                                            loop_function=loop_function)
         # our targets are decoder inputs shifted by one.
         targets = self.decoder_inputs[1:]
         # compute logits and loss
         output = tf.concat(0, self.outputs)
-        softmax_w = tf.Variable(tf.truncated_normal([size, vocab_size], -0.1, 0.1))
-        softmax_b = tf.Variable(tf.zeros([vocab_size]))
         # use a name scope to organize nodes in the graph visualizer
         with tf.name_scope("Wx_b") as _:
             logits = tf.matmul(output, softmax_w) + softmax_b
@@ -75,14 +91,14 @@ class ReverseSeqModel(object):
                 [tf.concat(0, targets)],
                 [tf.concat(0, self.decoder_weights[1:])],
                 softmax_loss_function=tf.nn.softmax_cross_entropy_with_logits)
-            self.loss = tf.reduce_sum(losses) / 256
+            self.loss = tf.reduce_sum(losses) / batch_size
             loss_summ = tf.scalar_summary("loss", self.loss)
 
         # Gradients and SGD update operation for training the model.
         if not forward_only:
             with tf.name_scope("train") as _:
                 optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-                gradients, v = zip(*optimizer.compute_gradients(self.loss))
+                gradients, v = zip(*optimizer.compute_gradients(self.loss, aggregation_method=2))
                 gradients, _ = tf.clip_by_global_norm(gradients, max_gradient_norm)
                 self.updates = optimizer.apply_gradients(zip(gradients, v), global_step=self.global_step)
                 # gradients_hist = tf.histogram_summary("gradients", tf.concat(gradients,0))
@@ -94,10 +110,12 @@ class ReverseSeqModel(object):
         self.saver = tf.train.Saver(tf.all_variables())
 
     @staticmethod
-    def basic_rnn_seq2seq(encoder_inputs, decoder_inputs, state, cell, dtype=tf.float32, scope=None):
+    def basic_rnn_seq2seq(encoder_inputs, decoder_inputs, state, cell, dtype=tf.float32, scope=None,
+                          loop_function=None):
         with tf.variable_scope(scope or "basic_rnn_seq2seq"):
             _, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=state, dtype=dtype)
-            outputs, state = tf.nn.seq2seq.rnn_decoder(decoder_inputs, enc_state, cell)
+            outputs, state = tf.nn.seq2seq.rnn_decoder(decoder_inputs, enc_state, cell,
+                                                       loop_function=loop_function, scope=scope)
             return outputs, state, enc_state
 
     @staticmethod
