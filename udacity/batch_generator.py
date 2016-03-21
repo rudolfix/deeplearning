@@ -1,6 +1,8 @@
 import string
 import numpy as np
 import random
+from itertools import accumulate
+import bisect
 
 
 class BatchGenerator(object):
@@ -128,3 +130,37 @@ class BatchGenerator(object):
     def logprob(predictions, labels):
         predictions[predictions < 1e-10] = 1e-10
         return np.sum(np.multiply(labels, -np.log(predictions))) / labels.shape[0]
+
+
+class RandomWordsBatchGenerator(object):
+    # http://norvig.com/mayzner.html
+    word_lengths_frequencies = [2.998, 17.651, 20.511, 14.787, 10.700, 8.388, 7.939, 5.943, 4.437, 3.076, 1.761, 0.958]
+    wlf_cumul = list(accumulate(word_lengths_frequencies))
+    wlf_cumul.append(100.001)
+
+    def __init__(self, batch_size, min_unrollings, max_unrollings, reverse_encoder_input = False):
+        self._batch_size = batch_size
+        self._min_unrollings = min_unrollings
+        self._max_unrollings = max_unrollings
+        self._reverse_encoder_input = reverse_encoder_input
+
+    @staticmethod
+    def gen_word():
+        # we check where random float lands on a line where word freq probs are represented as lengths
+        wf_prob = random.random() * 100.0
+        w_len = bisect.bisect(RandomWordsBatchGenerator.wlf_cumul, wf_prob) + 1
+        sentence = []
+        for _ in range(w_len):
+            sentence.append(chr(random.randint(ord('a'), ord('z'))))
+        return ''.join(sentence)
+
+    def next(self):
+        # generate string of random letters that make words that approximate english in length
+        sentence = ''
+        while len(sentence) < self._max_unrollings * self._batch_size:
+            sentence += self.gen_word() + ' '
+
+        sentence = sentence[:self._max_unrollings]
+        batch_generator = BatchGenerator(sentence, self._batch_size, self._min_unrollings, self._max_unrollings,
+                                         reverse_encoder_input=self._reverse_encoder_input, random_batch=False)
+        return batch_generator.next()
