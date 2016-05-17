@@ -25,21 +25,30 @@ import zipfile
 import urllib3
 import time
 import math
-from batch_generator import BatchGenerator, RandomWordsBatchGenerator
+from batch_generator import BatchGenerator, RandomWordsBatchGenerator, ReverseStringBatchGenerator
 from reverse_seq_model import ReverseSeqModel, ReverseSeqValidationSummaryModel
+from enum import Enum
+
+
+class UseTrainBatchType(Enum):
+    use_english_words = 1
+    use_random_train_words = 2,
+    use_random_string = 3
 
 BATCH_SIZE = 256
-MIN_CHARS_IN_BATCH = 64
-MAX_CHARS_IN_BATCH = 64
-NUM_LAYERS = 3
-UNITS_PER_LAYER = 512
+MIN_CHARS_IN_BATCH = 32
+MAX_CHARS_IN_BATCH = 32
+NUM_LAYERS = 4
+UNITS_PER_LAYER = 300
 DROPOUT_PROB = 0.6
 LEARNING_RATE = 0.03
-RUN_NAME_SUFFIX = 'L0.03-NOPAD-ENGTRAIN '  # additional suffix to describe run names
 REVERSE_ENCODER_INPUT = False
 DECODER_FEED_PREVIOUS = False
 USE_LSTM = True
-USE_RANDOM_TRAIN_WORDS = False
+USE_ATTENTION = False
+TRAIN_BATCH_TYPE = UseTrainBatchType.use_random_train_words
+RUN_NAME_SUFFIX = 'L0.03-NOPAD-RANDOMWORDS-32CHARS'  # additional suffix to describe run names
+# L0.03-NOPAD-RANDOMWORDS
 
 GRADIENT_CLIP = 5
 LEARNING_RATE_DECAY_RATIO = 0.97
@@ -79,7 +88,8 @@ def create_model(session, num_layers, units_per_layer, forward_only, decoder_fee
     model = ReverseSeqModel(BATCH_SIZE, units_per_layer, num_layers,
                             BatchGenerator.VOCABULARY_SIZE,
                             MAX_CHARS_IN_BATCH, GRADIENT_CLIP, LEARNING_RATE, LEARNING_RATE_DECAY_RATIO,
-                            forward_only=forward_only, use_lstm=USE_LSTM, feed_previous=decoder_feed_previous)
+                            forward_only=forward_only, use_lstm=USE_LSTM, feed_previous=decoder_feed_previous,
+                            use_attention=USE_ATTENTION)
     run_data_dir = run_data_directory(num_layers, units_per_layer)
     model.summ_writer = tf.train.SummaryWriter(run_data_dir, session.graph_def, flush_secs=1)
     ckpt = tf.train.get_checkpoint_state(run_data_dir)
@@ -113,14 +123,20 @@ def train(num_layers, units_per_layer):
             valid_text = text[:valid_size]
             train_text = text[valid_size:]
             # create batch generators
-            if not USE_RANDOM_TRAIN_WORDS:
-                train_batch = BatchGenerator(train_text, BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
-                                            reverse_encoder_input=REVERSE_ENCODER_INPUT)
-            else:
-                train_batch = RandomWordsBatchGenerator(BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
-                                                        reverse_encoder_input=REVERSE_ENCODER_INPUT)
             validation_batch = BatchGenerator(valid_text, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
                                               reverse_encoder_input=REVERSE_ENCODER_INPUT)
+            if TRAIN_BATCH_TYPE == UseTrainBatchType.use_english_words:
+                train_batch = BatchGenerator(train_text, BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                             reverse_encoder_input=REVERSE_ENCODER_INPUT)
+            elif TRAIN_BATCH_TYPE == UseTrainBatchType.use_random_train_words:
+                train_batch = RandomWordsBatchGenerator(BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                                        reverse_encoder_input=REVERSE_ENCODER_INPUT)
+            else:
+                train_batch = ReverseStringBatchGenerator(BATCH_SIZE, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                                          reverse_encoder_input=REVERSE_ENCODER_INPUT)
+                validation_batch = ReverseStringBatchGenerator(1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
+                                                               reverse_encoder_input=REVERSE_ENCODER_INPUT)
+
 
             # This is the training loop.
             step_time, loss = 0.0, 0.0
@@ -159,8 +175,8 @@ def train(num_layers, units_per_layer):
                         {validation_model.validation_perp: val_perp if val_perp < 500 else 500 },
                         validation_session)
                     model.summ_writer.add_summary(summary_str, current_step)
-
                     sys.stdout.flush()
+                    # decode_sentence(sess, model, enc_state, current_step)
 
 
 def decode(num_layers, units_per_layer):
@@ -168,19 +184,28 @@ def decode(num_layers, units_per_layer):
     with tf.Session(graph=tf.Graph()) as sess:
         # Create model.
         print("Creating %d layers of %d units." % (num_layers, units_per_layer))
-        model = create_model(sess, num_layers, units_per_layer, False, True)
+        model = create_model(sess, num_layers, units_per_layer, False, False)
         current_step = model.global_step.eval() + 1
         enc_state = model.initial_enc_state.eval()
         print('starting from step %i' % current_step)
         # Decode from standard input.
+        decode_sentence(sess, model, enc_state, current_step)
+
+
+def decode_sentence(sess, model, enc_state, current_step):
+    print('press ENTER to exit decoder')
+    sentence = input('>')
+    while sentence:
+        # make it exactly max_unrollings and not less than min_unrollings
+        sentence = sentence[:MAX_CHARS_IN_BATCH]
+        len_s = len(sentence)
+        sentence += '.'*(MAX_CHARS_IN_BATCH-len(sentence)) + 'aaa'
+        # set MAX_CHARS_IN_BATCH as min_unrollings as we prepared the string already
+        validation_batch = BatchGenerator(sentence, 1, len_s, MAX_CHARS_IN_BATCH,
+                                          reverse_encoder_input=REVERSE_ENCODER_INPUT, random_batch=False,
+                                          always_min_unrollings=True)
+        validate_sentence(sess, model, validation_batch, enc_state, current_step)
         sentence = input('>')
-        while sentence:
-            # make it exactly max_unrollings and not less than min_unrollings
-            sentence = sentence[:MAX_CHARS_IN_BATCH] + ' '*(MIN_CHARS_IN_BATCH-len(sentence))
-            validation_batch = BatchGenerator(sentence, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH,
-                                              reverse_encoder_input=True, random_batch=False)
-            validate_sentence(sess, model, validation_batch, enc_state, current_step)
-            sentence = input('>')
 
 
 def validate_sentence(session, model, validation_batch, encoder_state, current_step):
@@ -226,6 +251,7 @@ def run_test():
     valid_batches = BatchGenerator(valid_text, 1, MIN_CHARS_IN_BATCH, MAX_CHARS_IN_BATCH)
 
     # print(BatchGenerator.characters(train_batches.next()[0]))
+    print('test main batch generator')
     e_bs, d_bs, dw_bs = train_batches.next()
     print(BatchGenerator.batches2string(e_bs))
     print(BatchGenerator.batches2string(d_bs))
@@ -251,6 +277,20 @@ def run_test():
         print(BatchGenerator.batches2string(e_bs))
         print(BatchGenerator.batches2string(d_bs))
         BatchGenerator.verify_weights(d_bs, dw_bs)
+
+    print('test random string gen with padding')
+    random_str_batch = ReverseStringBatchGenerator(1, 8, 8,
+                                             reverse_encoder_input=False)
+    e_bs, d_bs, dw_bs = random_str_batch.next()
+    print(BatchGenerator.batches2string(e_bs))
+    print(BatchGenerator.batches2string(d_bs))
+    BatchGenerator.verify_weights(d_bs, dw_bs)
+    random_str_batch = ReverseStringBatchGenerator(2, 8, 16,
+                                             reverse_encoder_input=False)
+    e_bs, d_bs, dw_bs = random_str_batch.next()
+    print(BatchGenerator.batches2string(e_bs))
+    print(BatchGenerator.batches2string(d_bs))
+    BatchGenerator.verify_weights(d_bs, dw_bs)
 
 
 def main(_):
