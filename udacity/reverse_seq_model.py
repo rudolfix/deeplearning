@@ -7,7 +7,7 @@ class ReverseSeqModel(object):
     def __init__(self, batch_size, units_per_layer, num_layers, vocab_size, max_unrollings,
                  max_gradient_norm, learning_rate,
                  learning_rate_decay_factor, use_lstm=True,
-                 forward_only=False, feed_previous=False):
+                 forward_only=False, feed_previous=False, use_attention=False):
         """Create the model.
 
         Args:
@@ -72,10 +72,16 @@ class ReverseSeqModel(object):
         # zs = cell.zero_state(256, tf.float32) # tf.placeholder(tf.float32, shape=[None, 2 * size])
         self.initial_enc_state = tf.truncated_normal([batch_size, cell.state_size], -0.1, 0.1)
         # run encoder - decoder
-        self.outputs, _, self.enc_state = ReverseSeqModel.basic_rnn_seq2seq(self.encoder_inputs,
-                                                                            self.decoder_inputs[:max_unrollings + 1],
-                                                                            self.initial_enc_state, cell,
-                                                                            loop_function=loop_function)
+        if use_attention:
+            self.outputs, _, self.enc_state = ReverseSeqModel.attention_rnn_seq2seq(self.encoder_inputs,
+                                                                                self.decoder_inputs[:max_unrollings + 1],
+                                                                                self.initial_enc_state, cell,
+                                                                                loop_function=loop_function)
+        else:
+            self.outputs, _, self.enc_state = ReverseSeqModel.basic_rnn_seq2seq(self.encoder_inputs,
+                                                                                self.decoder_inputs[:max_unrollings + 1],
+                                                                                self.initial_enc_state, cell,
+                                                                                loop_function=loop_function)
         # our targets are decoder inputs shifted by one.
         targets = self.decoder_inputs[1:]
         # compute logits and loss
@@ -110,19 +116,35 @@ class ReverseSeqModel(object):
         self.saver = tf.train.Saver(tf.all_variables())
 
     @staticmethod
-    def basic_rnn_seq2seq(encoder_inputs, decoder_inputs, state, cell, dtype=tf.float32, scope=None,
+    def basic_rnn_seq2seq(encoder_inputs, decoder_inputs, initial_enc_state, cell, dtype=tf.float32, scope=None,
                           loop_function=None):
         with tf.variable_scope(scope or "basic_rnn_seq2seq"):
-            _, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=state, dtype=dtype)
+            _, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=initial_enc_state, dtype=dtype)
             outputs, state = tf.nn.seq2seq.rnn_decoder(decoder_inputs, enc_state, cell,
                                                        loop_function=loop_function, scope=scope)
             return outputs, state, enc_state
 
     @staticmethod
-    def tied_rnn_seq2seq(encoder_inputs, decoder_inputs, state, cell, loop_function=None, dtype=tf.float32, scope=None):
+    def attention_rnn_seq2seq(encoder_inputs, decoder_inputs, initial_enc_state, cell, dtype=tf.float32, scope=None,
+                              loop_function=None):
+        # todo: change scope name to attention_rnn_seq2seq
+        with tf.variable_scope(scope or "basic_rnn_seq2seq"):
+            enc_outputs, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=initial_enc_state, dtype=dtype)
+            # First calculate a concatenation of encoder outputs to put attention on.
+            top_states = [tf.reshape(e, [-1, 1, cell.output_size]) for e in enc_outputs]
+            attention_states = tf.concat(1, top_states)
+
+            outputs, state = tf.nn.seq2seq.attention_decoder(decoder_inputs, enc_state, attention_states, cell,
+                                                             loop_function=loop_function, scope=scope,
+                                                             initial_state_attention=True)
+            return outputs, state, enc_state
+
+    @staticmethod
+    def tied_rnn_seq2seq(encoder_inputs, decoder_inputs, initial_enc_state, cell, dtype=tf.float32, scope=None,
+                         loop_function=None):
         with tf.variable_scope("combined_tied_rnn_seq2seq"):
             scope = scope or "tied_rnn_seq2seq"
-            _, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=state, dtype=dtype, scope=scope)
+            _, enc_state = tf.nn.rnn(cell, encoder_inputs, initial_state=initial_enc_state, dtype=dtype, scope=scope)
             tf.get_variable_scope().reuse_variables()
             outputs, state = tf.nn.seq2seq.rnn_decoder(decoder_inputs, enc_state, cell,
                                                        loop_function=loop_function, scope=scope)
