@@ -17,7 +17,7 @@ class BatchGenerator(object):
     WORD_BREAKERS = [' ']
 
     def __init__(self, text, batch_size, min_unrollings, max_unrollings, reverse_encoder_input = False,
-                 random_batch = True):
+                 random_batch = True, always_min_unrollings=True):
         self._text = text
         self._text_size = len(text)
         self._batch_size = batch_size
@@ -26,6 +26,7 @@ class BatchGenerator(object):
         self._word_boundary_idx = self._idx = 0
         self._reverse_encoder_input = reverse_encoder_input
         self._random_batch = random_batch
+        self._always_min_unrollings = always_min_unrollings
 
     def reverse_word(self, decoder_batch, enc_idx, self_idx):
             idx_diff = (self_idx - self._word_boundary_idx) % self._text_size # needs modulo as idx may wrap
@@ -37,7 +38,8 @@ class BatchGenerator(object):
     def _next_batch(self):
         """Generate a single batch from the current cursor position in the data."""
         # generate variable size batch, will be padded to _max_unrollings
-        unrollings = random.randint(self._min_unrollings, self._max_unrollings)
+        unrollings = self._min_unrollings if self._always_min_unrollings \
+            else random.randint(self._min_unrollings, self._max_unrollings)
         if self._random_batch:
             # generate batch from random position on the text, corpus seems to be not mixed well
             self._word_boundary_idx = self._idx = random.randint(0, self._text_size - 1)
@@ -60,6 +62,7 @@ class BatchGenerator(object):
                 self.reverse_word(decoder_batch, enc_idx, self._idx)
                 self._word_boundary_idx = (self._word_boundary_idx + 1) % self._text_size # skip word breaker char
         # reverse remainder
+        # todo: when corpus boundary is crossed amd self._idx == self._word_boundary_idx this is not fired! FIX
         if self._idx != self._word_boundary_idx:
             self.reverse_word(decoder_batch, enc_idx + 1, (self._idx + 1) % self._text_size)
 
@@ -138,7 +141,7 @@ class RandomWordsBatchGenerator(object):
     wlf_cumul = list(accumulate(word_lengths_frequencies))
     wlf_cumul.append(100.001)
 
-    def __init__(self, batch_size, min_unrollings, max_unrollings, reverse_encoder_input = False):
+    def __init__(self, batch_size, min_unrollings, max_unrollings, reverse_encoder_input=False):
         self._batch_size = batch_size
         self._min_unrollings = min_unrollings
         self._max_unrollings = max_unrollings
@@ -160,7 +163,30 @@ class RandomWordsBatchGenerator(object):
         while len(sentence) < self._max_unrollings * self._batch_size:
             sentence += self.gen_word() + ' '
 
-        sentence = sentence[:self._max_unrollings]
+        sentence = sentence[:self._max_unrollings * self._batch_size]
         batch_generator = BatchGenerator(sentence, self._batch_size, self._min_unrollings, self._max_unrollings,
                                          reverse_encoder_input=self._reverse_encoder_input, random_batch=False)
+        return batch_generator.next()
+
+
+class ReverseStringBatchGenerator(object):
+    def __init__(self, batch_size, min_unrollings, max_unrollings, reverse_encoder_input=False):
+        self._batch_size = batch_size
+        self._min_unrollings = min_unrollings
+        self._max_unrollings = max_unrollings
+        self._reverse_encoder_input = reverse_encoder_input
+
+    @staticmethod
+    def gen_word(strlen):
+        sentence = []
+        for _ in range(strlen):
+            sentence.append(chr(random.randint(ord('a'), ord('z'))))
+        return ''.join(sentence)
+
+    def next(self):
+        # generate string of random letters
+        sentence = self.gen_word(self._max_unrollings * (self._batch_size+1))
+        batch_generator = BatchGenerator(sentence, self._batch_size, self._min_unrollings, self._max_unrollings,
+                                         reverse_encoder_input=self._reverse_encoder_input, random_batch=False,
+                                         always_min_unrollings=True)
         return batch_generator.next()
